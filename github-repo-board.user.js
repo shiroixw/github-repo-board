@@ -2,7 +2,7 @@
 // @name         GitHub 活跃看板
 // @name:en      GitHub Repo Active Board
 // @namespace    https://github.com/shiroixw/github-repo-board
-// @version      1.0.0
+// @version      1.1.0
 // @description  在 GitHub 仓库页右下角注入可折叠看板，浏览近 30 天活跃的 Issues / Pull Requests，点击即跳转
 // @author       shiroixw
 // @match        https://github.com/*
@@ -54,8 +54,10 @@
     sort: 'updated',   // updated | created | comments
     collapsed: false,
     openInNewTab: true,
-    token: '',         // 可选 GitHub Token，把额度从 60 次/小时提升到 5000 次/小时
+    token: '',         // 可选 GitHub Token：改用 REST API，字段更全、额度 5000 次/小时
     showToken: false,
+    totals: null,      // { issues, pulls } 仓库 open 总数（web 通路拿得到）
+    source: '',        // web | api
   };
 
   const ui = {};
@@ -118,12 +120,20 @@
   }
 
   /* ---------------- 数据 ---------------- */
-  function mapItem(it) {
+  /*
+   * 两条数据通路：
+   *   web（默认）—— 抓仓库的 Issues / Pulls 列表页，解析页面内嵌的 react-app.embeddedData。
+   *                 请求携带浏览器登录态（cookie），不走 api.github.com，因此不受 60 次/小时限流。
+   *                 代价：内嵌数据没有 label，最多取到第一页（25 条 / 类型）。
+   *   api（有 Token 时）—— GitHub REST API，字段最全（含 label / draft），额度 5000 次/小时。
+   * 未登录且 web 解析失败时，再退回匿名 API 兜底。
+   */
+  function mapApiItem(it, isPR) {
     return {
       number: it.number,
       title: it.title || '(无标题)',
       url: it.html_url,
-      isPR: !!it.pull_request,
+      isPR: isPR,
       draft: !!it.draft,
       user: (it.user && it.user.login) || 'ghost',
       comments: it.comments || 0,
@@ -132,6 +142,115 @@
       labels: (it.labels || [])
         .filter((l) => l && l.name)
         .map((l) => ({ name: l.name, color: (l.color || '').replace('#', '') })),
+    };
+  }
+
+  async function loadViaApi(repo) {
+    const headers = { Accept: 'application/vnd.github+json' };
+    if (state.token) headers.Authorization = 'Bearer ' + state.token;
+
+    const call = async (kind) => {
+      const url = API + '/repos/' + repo.owner + '/' + repo.repo + (kind === 'pulls' ? '/pulls' : '/issues') +
+        '?state=open&sort=updated&direction=desc&per_page=100&page=1';
+      const res = await fetch(url, { headers });
+
+      if (res.status === 401) throw new Error('Token 无效或已过期，请重新填写');
+      if (res.status === 403 || res.status === 429) {
+        const left = res.headers.get('x-ratelimit-remaining');
+        throw new Error('GitHub API 限流（未登录 60 次/小时' + (left === '0' ? '，已用尽' : '') + '）');
+      }
+      if (res.status === 404) throw new Error('仓库不存在或无权访问');
+      if (!res.ok) throw new Error('请求失败 HTTP ' + res.status);
+      return res.json();
+    };
+
+    const [issues, pulls] = await Promise.all([call('issues'), call('pulls')]);
+    const items = []
+      .concat((issues || []).filter((it) => !it.pull_request).map((it) => mapApiItem(it, false)))
+      .concat((pulls || []).map((it) => mapApiItem(it, true)));
+
+    return { items: items, totals: null, source: 'api' };
+  }
+
+  function parseEmbedded(html) {
+    const re = /<script[^>]*data-target="react-app\.embeddedData"[^>]*>([\s\S]*?)<\/script>/g;
+    let m;
+    while ((m = re.exec(html))) {
+      try {
+        const json = JSON.parse(m[1]);
+        const payload = json.payload || json;
+        if (payload && (payload.issuesIndexContentRoute || payload.repoPullsDashboardContentRoute)) {
+          return payload;
+        }
+      } catch (e) { /* 跳过其它 JSON 块 */ }
+    }
+    return null;
+  }
+
+  async function fetchListPage(repo, kind) {
+    const query = kind === 'pulls' ? 'is%3Apr' : 'is%3Aissue';
+    const path = '/' + repo.owner + '/' + repo.repo + (kind === 'pulls' ? '/pulls' : '/issues') +
+      '?q=' + query + '+is%3Aopen+sort%3Aupdated-desc';
+    const res = await fetch(path, { credentials: 'include', headers: { Accept: 'text/html' } });
+    if (!res.ok) throw new Error('抓取列表页失败 HTTP ' + res.status);
+    const payload = parseEmbedded(await res.text());
+    if (!payload) throw new Error('列表页结构无法解析');
+    return payload;
+  }
+
+  async function loadViaWeb(repo) {
+    const [issuePage, pullPage] = await Promise.all([
+      fetchListPage(repo, 'issues'),
+      fetchListPage(repo, 'pulls'),
+    ]);
+
+    const issueRoute = issuePage.issuesIndexContentRoute || {};
+    const pullRoute = pullPage.repoPullsDashboardContentRoute || {};
+    const items = [];
+
+    (issueRoute.results || []).forEach((row) => {
+      const it = row && row.issue;
+      if (!it || !it.number) return;
+      // Issues 列表页偶尔会混入 PR（itemType 区分）
+      const isPR = /PULL_REQUEST/.test(row.itemType || '');
+      items.push({
+        number: it.number,
+        title: it.title || '(无标题)',
+        url: it.permalink || ('https://github.com/' + repo.key + (isPR ? '/pull/' : '/issues/') + it.number),
+        isPR: isPR,
+        draft: false,
+        user: (it.author && it.author.login) || 'ghost',
+        comments: it.commentCount || 0,
+        createdAt: new Date(it.createdAt).getTime(),
+        updatedAt: new Date(it.updatedAt).getTime(),
+        labels: [],
+      });
+    });
+
+    (pullRoute.results || []).forEach((it) => {
+      if (!it || !it.number) return;
+      const author = it.author || {};
+      items.push({
+        number: it.number,
+        title: it.title || '(无标题)',
+        url: it.permalink || ('https://github.com/' + repo.key + '/pull/' + it.number),
+        isPR: true,
+        draft: /DRAFT/.test(it.displayState || ''),
+        user: author.displayLogin || author.login || 'ghost',
+        comments: it.commentCount || 0,
+        createdAt: new Date(it.createdAt).getTime(),
+        updatedAt: new Date(it.updatedAt).getTime(),
+        labels: [],
+      });
+    });
+
+    return {
+      items: items.filter((it) => isFinite(it.updatedAt)),
+      totals: {
+        issues: issueRoute.pageInfo ? issueRoute.pageInfo.totalCount : null,
+        pulls: pullRoute.totalCount == null ? null : pullRoute.totalCount,
+      },
+      source: 'web',
     };
   }
 
@@ -144,6 +263,8 @@
       const cached = readJSON(sessionStorage, cacheKey);
       if (cached && Array.isArray(cached.items) && Date.now() - cached.t < CACHE_TTL) {
         state.items = cached.items;
+        state.totals = cached.totals || null;
+        state.source = cached.source || '';
         state.updatedAt = cached.t;
         state.error = '';
         renderAll();
@@ -155,38 +276,46 @@
     state.error = '';
     renderList();
 
+    let result = null;
     try {
-      const url = API + '/repos/' + repo.owner + '/' + repo.repo +
-        '/issues?state=open&sort=updated&direction=desc&per_page=100&page=1';
-      const headers = { Accept: 'application/vnd.github+json' };
-      if (state.token) headers.Authorization = 'Bearer ' + state.token;
-      const res = await fetch(url, { headers });
-
-      if (res.status === 401) throw new Error('Token 无效或已过期，请重新填写');
-      if (res.status === 403 || res.status === 429) {
-        const left = res.headers.get('x-ratelimit-remaining');
-        throw new Error(
-          'GitHub API 限流（未登录 60 次/小时' + (left === '0' ? '，已用尽' : '') + '），可填 Token 提升到 5000 次/小时'
-        );
+      if (state.token) {
+        result = await loadViaApi(repo);
+      } else {
+        try {
+          result = await loadViaWeb(repo);
+        } catch (webErr) {
+          try {
+            result = await loadViaApi(repo);
+          } catch (apiErr) {
+            throw new Error(apiErr.message + '；页面解析也失败（' + webErr.message + '）');
+          }
+        }
       }
-      if (res.status === 404) throw new Error('仓库不存在或无权访问');
-      if (!res.ok) throw new Error('请求失败 HTTP ' + res.status);
-
-      const data = await res.json();
-      const cutoff = Date.now() - ACTIVE_DAYS * 24 * 3600 * 1000;
-      const items = (Array.isArray(data) ? data : [])
-        .map(mapItem)
-        .filter((it) => it.updatedAt >= cutoff);
-
-      state.items = items;
-      state.updatedAt = Date.now();
-      writeJSON(sessionStorage, cacheKey, { t: state.updatedAt, items });
     } catch (e) {
       state.error = (e && e.message) || String(e);
-    } finally {
-      state.loading = false;
-      renderAll();
     }
+
+    if (result) {
+      const cutoff = Date.now() - ACTIVE_DAYS * 24 * 3600 * 1000;
+      const items = result.items
+        .filter((it) => it.updatedAt >= cutoff)
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .slice(0, LIST_LIMIT);
+
+      state.items = items;
+      state.totals = result.totals;
+      state.source = result.source;
+      state.updatedAt = Date.now();
+      writeJSON(sessionStorage, cacheKey, {
+        t: state.updatedAt,
+        items: items,
+        totals: result.totals,
+        source: result.source,
+      });
+    }
+
+    state.loading = false;
+    renderAll();
   }
 
   /* ---------------- 视图计算 ---------------- */
@@ -236,9 +365,16 @@
     ui.list.textContent = '';
 
     const footerBits = ['近 ' + ACTIVE_DAYS + ' 天活跃'];
+    if (state.totals) {
+      const parts = [];
+      if (state.totals.issues != null) parts.push(state.totals.issues + ' issues');
+      if (state.totals.pulls != null) parts.push(state.totals.pulls + ' PRs');
+      if (parts.length) footerBits.push('共 ' + parts.join(' / '));
+    }
     if (state.updatedAt) footerBits.push('更新于 ' + relTime(state.updatedAt));
-    footerBits.push('缓存 ' + Math.round(CACHE_TTL / 60000) + ' 分钟');
     ui.footer.textContent = footerBits.join(' · ');
+    ui.footer.title = '数据源：' + (state.source === 'api' ? 'GitHub REST API' : '仓库页面（登录态，不消耗 API 额度）') +
+      ' · 缓存 ' + Math.round(CACHE_TTL / 60000) + ' 分钟';
 
     if (state.loading && !state.items.length) {
       ui.list.appendChild(hint('正在拉取活跃 Issues / PRs…', 'ghab-hint--loading'));
@@ -246,7 +382,7 @@
     }
     if (state.error) {
       const box = hint(state.error, 'ghab-hint--error');
-      if (/限流|Token/.test(state.error)) {
+      if (/限流|Token|解析/.test(state.error)) {
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.className = 'ghab__linkbtn';
@@ -382,7 +518,7 @@
       </div>
       <input class="ghab__search" data-role="search" type="search" placeholder="搜索标题 / #编号 / 作者" />
       <div class="ghab__tokenrow" data-role="tokenrow">
-        <input class="ghab__tokeninput" data-role="tokeninput" type="password" placeholder="GitHub Token（可选，提升 API 额度）" />
+        <input class="ghab__tokeninput" data-role="tokeninput" type="password" placeholder="GitHub Token（可选：改用 API，显示 label）" />
         <button type="button" class="ghab__tokensave" data-role="tokensave">保存</button>
       </div>
       <div class="ghab__list" data-role="list"></div>
@@ -706,6 +842,8 @@
       state.updatedAt = 0;
       state.error = '';
       state.q = '';
+      state.totals = null;
+      state.source = '';
       if (ui.search) ui.search.value = '';
       renderAll();
       loadData(false);

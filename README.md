@@ -25,7 +25,8 @@
 - **条目信息**：`#编号`、标题（两行截断）、作者、相对更新时间、评论数、最多 3 个 label、Draft 标记
 - **点击跳转**：默认新标签页打开，可在底栏切回当前页
 - **搜索 & 排序**：按标题 / `#编号` / 作者筛选；支持最近更新、最新创建、评论最多三种排序
-- **缓存**：每个仓库 `sessionStorage` 缓存 5 分钟，命中缓存不消耗 API 额度，`⟳` 可强制刷新
+- **不走 API 也不限流**：默认解析仓库页面内嵌数据（带登录态），不会撞上 `API rate limit exceeded`，见下方「数据来源与额度」
+- **缓存**：每个仓库 `sessionStorage` 缓存 5 分钟，命中缓存不发请求，`⟳` 可强制刷新
 - **SPA 适配**：监听 GitHub 的 `turbo:load` / `pjax:end` / `popstate`，切仓库自动重载；面板被页面重渲染移除后会自动挂回
 
 ## 安装
@@ -39,11 +40,17 @@
 
 装好后打开任意仓库页（含 issue / PR 页）即可看到面板。
 
-## 关于 API 额度
+## 数据来源与额度
 
-脚本走 GitHub 公开 REST API（`/repos/{owner}/{repo}/issues`），未登录时全局限额 **60 次/小时**，多仓库频繁切换可能触发限流。
+默认**不调用** `api.github.com`，因此不会遇到 `API rate limit exceeded`：
 
-被限流时面板会给出「填写 Token →」入口，粘贴一个 [Personal Access Token](https://github.com/settings/tokens)（无需任何 scope，公开仓库只读即可）后额度提升到 **5000 次/小时**。Token 只存在你浏览器的 `localStorage`（key `ghab:token`），不会发往除 `api.github.com` 之外的任何地方。
+1. **页面通路（默认）**：抓取仓库的 `/issues`、`/pulls` 列表页，解析页面内嵌的 `react-app.embeddedData` JSON。
+   请求走浏览器登录态（cookie），免费、无额度限制，私有仓库也能读；附带仓库 open 总数。
+   代价：内嵌数据不含 label，每类最多取第一页 25 条。
+2. **API 通路（填了 Token 时）**：走 GitHub REST API，含 label / draft 等完整字段，额度 5000 次/小时。
+3. 页面解析失败时（未登录、页面改版等）自动退回匿名 API 兜底——这时才可能碰到 60 次/小时限流，面板会给出「填写 Token →」入口。
+
+Token 只存在你浏览器的 `localStorage`（key `ghab:token`），不会发往除 `api.github.com` 之外的任何地方。
 
 ## 可调参数
 
