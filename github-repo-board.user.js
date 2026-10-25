@@ -2,7 +2,7 @@
 // @name         GitHub 活跃看板
 // @name:en      GitHub Repo Active Board
 // @namespace    https://github.com/shiroixw/github-repo-board
-// @version      1.1.0
+// @version      1.1.1
 // @description  在 GitHub 仓库页右下角注入可折叠看板，浏览近 30 天活跃的 Issues / Pull Requests，点击即跳转
 // @author       shiroixw
 // @match        https://github.com/*
@@ -355,8 +355,15 @@
     ui.tabPulls.classList.toggle('is-active', state.tab === 'pulls');
     ui.badge.textContent = view.issueCount + view.prCount;
     if (state.q !== ui.search.value) ui.search.value = state.q;
+    renderQueryState();
 
     renderList();
+  }
+
+  function renderQueryState() {
+    if (!ui.panel) return;
+    ui.panel.classList.toggle('ghab--hasq', !!state.q);
+    if (ui.search && ui.search.title !== state.q) ui.search.title = state.q || '';
   }
 
   function renderList() {
@@ -400,7 +407,25 @@
       return;
     }
     if (!view.list.length) {
-      ui.list.appendChild(hint(state.q ? '没有匹配的结果' : '近 ' + ACTIVE_DAYS + ' 天内没有活跃的条目', ''));
+      if (state.q) {
+        const q = state.q.length > 16 ? state.q.slice(0, 16) + '…' : state.q;
+        const box = hint('没有匹配「' + q + '」的结果', '');
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'ghab__linkbtn';
+        btn.textContent = '清除搜索';
+        btn.addEventListener('click', () => {
+          state.q = '';
+          if (ui.search) ui.search.value = '';
+          renderQueryState();
+          renderList();
+        });
+        box.appendChild(document.createElement('br'));
+        box.appendChild(btn);
+        ui.list.appendChild(box);
+      } else {
+        ui.list.appendChild(hint('近 ' + ACTIVE_DAYS + ' 天内没有活跃的条目', ''));
+      }
       return;
     }
 
@@ -516,9 +541,22 @@
           <option value="comments">评论最多</option>
         </select>
       </div>
-      <input class="ghab__search" data-role="search" type="search" placeholder="搜索标题 / #编号 / 作者" />
+      <div class="ghab__searchwrap" data-role="searchwrap">
+        <input
+          class="ghab__search" data-role="search" type="text"
+          name="ghab-query-9c1f" placeholder="搜索标题 / #编号 / 作者"
+          autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+          data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other"
+        />
+        <button type="button" class="ghab__searchclear" data-role="searchclear" title="清除搜索">×</button>
+      </div>
       <div class="ghab__tokenrow" data-role="tokenrow">
-        <input class="ghab__tokeninput" data-role="tokeninput" type="password" placeholder="GitHub Token（可选：改用 API，显示 label）" />
+        <input
+          class="ghab__tokeninput" data-role="tokeninput" type="password"
+          name="ghab-token-4b7d" placeholder="GitHub Token（可选：改用 API，显示 label）"
+          autocomplete="new-password" spellcheck="false"
+          data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other"
+        />
         <button type="button" class="ghab__tokensave" data-role="tokensave">保存</button>
       </div>
       <div class="ghab__list" data-role="list"></div>
@@ -579,21 +617,44 @@
       renderList();
     });
 
+    // 防自动填充：只有用户真的敲键 / 粘贴 / 输入法上屏，才把内容当搜索词。
+    // 浏览器或密码管理器（Bitwarden / 1Password / LastPass 等）往输入框塞的邮箱、账号一律丢弃，
+    // 否则列表会被莫名其妙过滤成「没有匹配的结果」。
+    let typed = false;
     let timer = null;
-    ui.search.addEventListener('input', () => {
+
+    const applyQuery = (value) => {
+      state.q = value;
+      renderQueryState();
+      renderList();
+    };
+    const clearQuery = () => {
+      typed = false;
       clearTimeout(timer);
-      timer = setTimeout(() => {
-        state.q = ui.search.value;
-        renderList();
-      }, 180);
-    });
+      ui.search.value = '';
+      applyQuery('');
+    };
+
     ui.search.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') {
-        ui.search.value = '';
-        state.q = '';
-        renderList();
-      }
+      typed = true;
       e.stopPropagation();
+      if (e.key === 'Escape') clearQuery();
+    });
+    ui.search.addEventListener('paste', () => { typed = true; });
+    ui.search.addEventListener('compositionend', () => { typed = true; });
+    ui.search.addEventListener('input', () => {
+      if (!typed) {
+        // 非用户输入（自动填充），直接回滚，不触发过滤
+        ui.search.value = '';
+        return;
+      }
+      clearTimeout(timer);
+      timer = setTimeout(() => applyQuery(ui.search.value), 180);
+    });
+    panel.querySelector('[data-role="searchclear"]').addEventListener('click', (e) => {
+      e.stopPropagation();
+      clearQuery();
+      ui.search.focus();
     });
 
     ui.newTab.addEventListener('change', () => {
@@ -724,13 +785,28 @@
   background: var(--bgColor-default, #ffffff);
   border: 1px solid var(--borderColor-default, #d1d9e0); border-radius: 6px; cursor: pointer;
 }
+#${PANEL_ID} .ghab__searchwrap{ position: relative; margin: 0 10px 6px; }
 #${PANEL_ID} .ghab__search{
-  margin: 0 10px 6px; height: 26px; padding: 0 8px; width: calc(100% - 20px);
+  display: block; width: 100%; height: 26px; padding: 0 26px 0 8px; margin: 0;
   font-size: 11px; font-family: inherit; color: var(--fgColor-default, #1f2328);
   background: var(--bgColor-default, #ffffff);
   border: 1px solid var(--borderColor-default, #d1d9e0); border-radius: 6px; outline: none;
+  -webkit-appearance: none; appearance: none;
 }
 #${PANEL_ID} .ghab__search:focus{ border-color: #0969da; box-shadow: 0 0 0 2px rgba(9,105,218,.2); }
+#${PANEL_ID} .ghab__searchclear{
+  position: absolute; right: 3px; top: 50%; transform: translateY(-50%);
+  width: 20px; height: 20px; padding: 0; display: none;
+  align-items: center; justify-content: center;
+  font-size: 14px; line-height: 1; font-family: inherit;
+  color: var(--fgColor-muted, #59636e); background: transparent;
+  border: 0; border-radius: 6px; cursor: pointer;
+}
+#${PANEL_ID}.ghab--hasq .ghab__searchclear{ display: inline-flex; }
+#${PANEL_ID} .ghab__searchclear:hover{
+  background: var(--bgColor-neutral-muted, rgba(129,139,152,.16));
+  color: var(--fgColor-default, #1f2328);
+}
 #${PANEL_ID} .ghab__tokenrow{ display: none; gap: 6px; padding: 0 10px 6px; }
 #${PANEL_ID}.ghab--token .ghab__tokenrow{ display: flex; }
 #${PANEL_ID} .ghab__tokeninput{
